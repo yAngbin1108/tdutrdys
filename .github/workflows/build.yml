@@ -1,0 +1,129 @@
+name: build-ipa
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Unpack sources
+        run: |
+          set -euo pipefail
+          rm -rf src
+          mkdir -p src
+
+          ZIP="$(find . -maxdepth 2 -name '*.zip' -not -path './.git/*' | grep -i 'lara' | head -n 1 || true)"
+          if [ -z "${ZIP:-}" ]; then
+            ZIP="$(find . -maxdepth 2 -name '*.zip' -not -path './.git/*' | head -n 1 || true)"
+          fi
+          if [ -n "${ZIP:-}" ]; then
+            echo "[*] found archive: $ZIP -> extracting into src/"
+            unzip -q -o "$ZIP" -d src
+          else
+            echo "[*] no archive found; treating repo root as project root"
+            mkdir -p src/_pkg
+            find . -maxdepth 1 -mindepth 1 ! -name '.git' ! -name 'src' -exec cp -R {} src/_pkg/ \;
+          fi
+
+          PROJ="$(find src -maxdepth 5 -name '*.xcodeproj' -type d | head -n 1 || true)"
+          if [ -z "$PROJ" ]; then
+            echo "ERROR: no .xcodeproj found. Contents of src/:"
+            find src -maxdepth 4 | head -n 80
+            exit 1
+          fi
+          PROJ_DIR="$(cd "$(dirname "$PROJ")" && pwd)"
+          echo "[*] project root: $PROJ_DIR"
+          echo "PROJ_DIR=$PROJ_DIR" >> "$GITHUB_ENV"
+          ls -la "$PROJ_DIR"
+
+      - name: Show Xcode
+        run: |
+          sudo xcode-select -s "$(ls -d /Applications/Xcode*.app | sort -V | tail -1)"
+          xcodebuild -version
+          xcodebuild -showsdks | grep -i iphoneos || true
+
+      - name: Install ldid
+        run: brew install ldid
+
+      - name: Build
+        working-directory: ${{ env.PROJ_DIR }}
+        run: |
+          set -euo pipefail
+          xcodebuild -list -project lara.xcodeproj || true
+
+          rm -rf "$PWD/build"
+          mkdir -p "$PWD/build"
+
+          COMMON="-project lara.xcodeproj -configuration Release -sdk iphoneos -derivedDataPath $PWD/build/DerivedData CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY= CODE_SIGN_ENTITLEMENTS=Config/lara.entitlements"
+
+          if ! xcodebuild $COMMON -scheme lara -destination 'generic/platform=iOS' clean build; then
+            echo "[!] scheme build failed -> retrying with -target lara"
+            rm -rf "$PWD/build/DerivedData"
+            xcodebuild $COMMON -target lara -arch arm64 clean build
+          fi
+
+      - name: Package ipa
+        working-directory: ${{ env.PROJ_DIR }}
+        run: |
+          set -euo pipefail
+
+          APP="$(find "$PWD/build" -maxdepth 7 -type d -name 'lara.app' | head -n 1 || true)"
+          if [ -z "$APP" ]; then
+            echo "ERROR: lara.app not found under build/. Tree:"
+            find "$PWD/build" -maxdepth 7 | head -n 80
+            exit 1
+          fi
+          echo "[*] app bundle: $APP"
+
+          rm -rf "$PWD/build/Payload"
+          mkdir -p "$PWD/build/Payload"
+          cp -R "$APP" "$PWD/build/Payload/"
+          PL="$PWD/build/Payload/lara.app"
+
+          echo "[*] signing main binary"
+          ldid -SConfig/lara.entitlements "$PL/lara"
+
+          if [ -d "$PL/Frameworks" ]; then
+            echo "[*] signing embedded binaries"
+            for f in "$PL/Frameworks"/*; do
+              [ -e "$f" ] || continue
+              case "$f" in
+                *.framework)
+                  BIN="$f/$(basename "$f" .framework)"
+                  [ -f "$BIN" ] && ldid -S "$BIN"
+                  ;;
+                *.dylib)
+                  ldid -S "$f"
+                  ;;
+                *)
+                  [ -f "$f" ] && ldid -S "$f" || true
+                  ;;
+              esac
+            done
+          fi
+
+          /usr/libexec/PlistBuddy -c "Set :UIFileSharingEnabled true" "$PL/Info.plist" 2>/dev/null \
+            || /usr/libexec/PlistBuddy -c "Add :UIFileSharingEnabled bool true" "$PL/Info.plist"
+
+          (cd "$PWD/build" && zip -qry lara.ipa Payload)
+          rm -rf "$PWD/build/Payload"
+          ls -lh "$PWD/build/lara.ipa"
+
+      - name: Upload ipa
+        uses: actions/upload-artifact@v4
+        with:
+          name: lara-ipa
+          path: ${{ env.PROJ_DIR }}/build/lara.ipa
+          if-no-files-found: error
+          retention-days: 30
